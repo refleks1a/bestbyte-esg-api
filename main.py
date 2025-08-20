@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware  # type: ignore
 import pandas as pd
 import io
 import numpy as np
@@ -8,10 +9,21 @@ import math
 
 app = FastAPI()
 
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 def calculate_percentage_change(df, column_name):
     df['percentage_change'] = df[column_name].pct_change() * 100
     df['percentage_change'] = df['percentage_change'].where(pd.notna(df['percentage_change']), 0)
     return df[['Month', 'percentage_change']].to_dict(orient='records')
+
 
 @app.post("/uploadfile/")
 async def create_upload_file(file: UploadFile = File(...)):
@@ -35,9 +47,6 @@ async def create_upload_file(file: UploadFile = File(...)):
             results['water_usage_change'] = calculate_percentage_change(df_water, 'Water Usage (cubic meters)')
 
         # Employee Safety
-        if 'Employee Safety' in xls.sheet_names:
-            df_safety = pd.read_excel(xls, 'Employee Safety')
-            results['employee_safety_change'] = calculate_percentage_change(df_safety, 'Incidents Reported')
 
         # Energy Sources
         if 'Energy Sources' in xls.sheet_names:
@@ -76,6 +85,11 @@ async def create_upload_file(file: UploadFile = File(...)):
                 if isinstance(item, dict):
                     if item["percentage_change"] == (float('inf') or float('-inf')):
                         item["percentage_change"] = None
+
+        if 'Employee Safety' in xls.sheet_names:
+            df_safety = pd.read_excel(xls, 'Employee Safety')
+            results['employee_safety_change'] = df_safety.to_dict(orient='records')
+
 
         return results
 

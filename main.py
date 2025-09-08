@@ -1,9 +1,17 @@
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware  # type: ignore
+from fastapi.responses import StreamingResponse
+
 import pandas as pd
 import io
 import numpy as np
+
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.enums import TA_CENTER
+
 
 import math
 
@@ -17,11 +25,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
-
 app = FastAPI()
-
-client = genai.Client(api_key=os.getenv("GENAI_API_KEY"))
-
 
 
 app.add_middleware(
@@ -78,7 +82,11 @@ def labor_rights_compliance_score(df):
 
 
 @app.post("/uploadfile/")
-async def create_upload_file(file: UploadFile = File(...)):
+async def create_upload_file(
+    file: UploadFile = File(...)
+    ):
+
+
     if not file.filename.endswith(('.xlsx', '.xls')):
         return JSONResponse(status_code=400, content={"message": "Invalid file type. Please upload an Excel file."})
 
@@ -209,10 +217,7 @@ async def create_upload_file(file: UploadFile = File(...)):
                 "Free float": item["shareholder percentages (broad composition). Free float"] * 100,
             })
         
-        # shareholder_data["shareholder percentages (broad composition).Pension fund"] = shareholder_data["shareholder percentages (broad composition).Pension fund"] * 100
-        # shareholder_data["shareholder percentages (broad composition). Ataturk shares"] = shareholder_data["shareholder percentages (broad composition). Ataturk shares"] * 100
-        # shareholder_data["shareholder percentages (broad composition). Free float"] = shareholder_data["shareholder percentages (broad composition). Free float"] * 100
-
+        
         results["shareholder_rights_data"] = shareholder_data
 
 
@@ -220,3 +225,94 @@ async def create_upload_file(file: UploadFile = File(...)):
 
     except Exception as e:
         return JSONResponse(status_code=500, content={"message": f"There was an error processing the file: {e}"})
+    
+
+
+client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
+@app.post("/report")
+async def generate_esg_report(
+    excel_file: UploadFile = File(...),
+):
+    report_text = os.getenv("REPORT_TEXT")
+
+    if not os.getenv("GEMINI_API_KEY"):
+        raise HTTPException(status_code=500, detail="API key is not configured. Please set the GEMINI_API_KEY environment variable.")
+
+    try:
+        file_contents = await excel_file.read()
+        xls = pd.ExcelFile(io.BytesIO(file_contents))
+
+        df = pd.read_excel(xls, 'ESG Metrics')
+
+        df_json = df.to_json(orient='records')
+        
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to process the uploaded file: {str(e)}")
+
+    sections = {
+        "Executive Summary / CEO Letter": "Write a compelling executive summary and CEO letter. Focus on the purpose, company vision, sustainability strategy, and key highlights.",
+        "About the Company": "Provide a detailed business overview, including the company's mission, values, and the relevance of ESG to its business model. Use the provided text as the basis.",
+        "Materiality Assessment": "Describe the stakeholder engagement process and identify the most relevant ESG issues for the company. Include a high-level overview of the materiality assessment.",
+        "Governance": "Detail the company's governance structure, including board oversight of ESG, risk management, and ethics policies. Use the provided text to describe risk management, ethics policies, and compliance.",
+        "Environmental": "Summarize the company's environmental strategy, including climate change goals, GHG emissions, and energy use. Incorporate specific targets and achievements from the provided text and the metrics data.",
+        "Social": "Write about the company's social responsibility, including workforce well-being, DEI efforts, and community engagement. Use the provided text to highlight key initiatives and achievements.",
+        "Performance Metrics & Targets": "Present key ESG performance metrics and targets. Use the data from the provided JSON to create a quantitative summary. Mention specific targets from the text.",
+        "Case Studies / Highlights": "Describe the company's success stories or flagship initiatives. Use the provided text to detail the operational resilience and sustainable lending case studies.",
+        "Assurance & Verification": "Explain the process of external assurance and verification of ESG data. Include any relevant certifications or third-party reviews mentioned in the provided text.",
+        "Appendices": "Outline the content of the appendices, including methodology, glossary, and alignment with global standards like GRI and SASB, based on the provided text."
+    }
+
+    report_sections = {}
+
+    for title, prompt in sections.items():
+        try:
+            full_prompt = (
+                f"Based on the following source text and data, write the '{title}' section of a corporate ESG report.\n\n"
+                f"Source Text:\n{report_text}\n\n"
+                f"Quantitative Data (JSON):\n{df_json}\n\n"
+                f"Section Instructions:\n{prompt}\n\n"
+                f"Ensure the output is a well-structured paragraph or set of paragraphs, suitable for a professional report."
+            )
+            response = client.models.generate_content(model="gemini-2.5-flash", contents=full_prompt)
+            report_sections[title] = response.text
+        except Exception as e:
+            # Fallback for failed generations
+            report_sections[title] = f"Content generation failed for this section. Error: {e}"
+
+    # PDF Generation
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    
+    # Define styles for the document
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle('TitleStyle', parent=styles['Heading1'], spaceAfter=12, alignment=TA_CENTER)
+    heading_style = styles['Heading2']
+    paragraph_style = styles['Normal']
+    
+    flowables = []
+    
+    # Title Page
+    flowables.append(Paragraph("ESG Report", title_style))
+    flowables.append(Paragraph("Generated by AI", ParagraphStyle('SubTitleStyle', parent=styles['Normal'], alignment=TA_CENTER)))
+    flowables.append(Spacer(1, 48))
+    # Add each generated section to the PDF
+    for title, content in report_sections.items():
+        flowables.append(Paragraph(title, heading_style))
+        flowables.append(Spacer(1, 6))
+        
+        # Split content into paragraphs for better formatting
+        for para in content.split('\n'):
+            if para.strip():
+                flowables.append(Paragraph(para.strip(), paragraph_style))
+                flowables.append(Spacer(1, 6))
+        
+        flowables.append(Spacer(1, 18))
+    doc.build(flowables)
+    
+    # Move buffer position to the beginning and return
+    buffer.seek(0)
+    return StreamingResponse(buffer, media_type="application/pdf", headers={
+        "Content-Disposition": "attachment; filename=ESG_Report.pdf"
+    })
+
